@@ -1,8 +1,11 @@
-from flask import Flask, request, jsonify, Response
 import io
+import base64
 import logging
-import pikepdf
-import requests  # لتحميل الملف من الرابط عند الحاجة
+
+from flask import Flask, request, jsonify
+import requests
+import fitz  # PyMuPDF
+from PIL import Image
 
 app = Flask(__name__)
 
@@ -10,129 +13,168 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
+def download_file(url: str) -> bytes:
     """
-    ضغط PDF بسيط عن طريق إعادة حفظه عبر pikepdf.
-    لا نستخدم optimize_streams لأن النسخة الحالية لا تدعمه.
+    تنزيل الملف من الرابط (Google Drive direct link).
     """
-
-    orig_size = len(pdf_bytes)
-
-    input_stream = io.BytesIO(pdf_bytes)
-    output_stream = io.BytesIO()
-
-    with pikepdf.open(input_stream) as pdf:
-        # حفظ عادي (فيه بعض الضغط تلقائياً)
-        pdf.save(output_stream)
-
-    compressed_bytes = output_stream.getvalue()
-    comp_size = len(compressed_bytes)
-
-    logger.info(
-        "Compression done: original=%d KB, compressed=%d KB",
-        orig_size // 1024,
-        comp_size // 1024,
-    )
-
-    return compressed_bytes, orig_size, comp_size
+    resp = requests.get(url, timeout=40)
+    resp.raise_for_status()
+    return resp.content
 
 
-@app.route("/", methods=["GET"])
+def compress_pdf_images(pdf_bytes: bytes, target_kb: int | None = None):
+    """
+    ضغط PDF عن طريق إعادة ضغط الصور بداخله بجودة أقل.
+
+    - target_kb: الحجم المطلوب تقريبياً بالكيلو بايت (اختياري).
+                 نستخدمه لحساب جودة تقريبية للصور.
+    """
+    original_size = len(pdf_bytes)
+    original_kb = round(original_size / 1024)
+
+    # افتح الـ PDF من الذاكرة
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # احسب نسبة الهدف (كم نريد أن ننزل تقريباً)
+    if target_kb and target_kb > 0:
+        ratio = target_kb / max(original_kb, 1)
+        # نحدّها بين 0.2 و 0.9 حتى ما نخرب الصور جداً
+        ratio = max(0.2, min(ratio, 0.9))
+    else:
+        # لو ما أرسلنا target، نستخدم ضغط متوسط
+        ratio = 0.7
+
+    # جودة JPEG بين 30 و 95
+    base_quality = 95
+    quality = int(base_quality * ratio)
+    quality = max(35, min(quality, 90))
+
+    logger.info(f"Original size: {original_kb} KB, target: {target_kb}, "
+                f"ratio={ratio:.2f}, jpeg_quality={quality}")
+
+    # مقياس تصغير أبعاد الصور (downscale)
+    # لو الهدف أصغر بكثير من الأصل، نصغّر الأبعاد أيضاً
+    if target_kb and target_kb < original_kb:
+        scale = max(0.4, min(ratio, 0.9))
+    else:
+        scale = 0.8
+
+    pages_count = len(doc)
+    images_replaced = 0
+
+    for page_index in range(pages_count):
+        page = doc[page_index]
+        img_list = page.get_images(full=True)
+
+        for img in img_list:
+            xref = img[0]
+            try:
+                pix = fitz.Pixmap(doc, xref)
+            except Exception as e:
+                logger.warning(f"Failed to get pixmap for xref {xref}: {e}")
+                continue
+
+            # تخطي الصور الصغيرة جداً (لن توفر كثيراً)
+            if pix.width < 400 and pix.height < 400:
+                pix = None
+                continue
+
+            # تحويل إلى RGB
+            if pix.n >= 4:  # يحتمل قناة ألفا
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+
+            # تحويل إلى صورة Pillow
+            mode = "RGB"
+            img_pil = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+            # تصغير الأبعاد
+            new_w = int(img_pil.width * scale)
+            new_h = int(img_pil.height * scale)
+            if new_w < 200 or new_h < 200:
+                # لا نصغر أكثر من اللازم
+                new_w = max(new_w, 200)
+                new_h = max(new_h, 200)
+
+            if (new_w, new_h) != img_pil.size:
+                img_pil = img_pil.resize((new_w, new_h), Image.LANCZOS)
+
+            # حفظ إلى JPEG بجودة أقل
+            buf = io.BytesIO()
+            img_pil.save(buf, format="JPEG", quality=quality, optimize=True)
+            new_image_bytes = buf.getvalue()
+
+            # تحديث الصورة داخل الـ PDF
+            try:
+                doc.update_image(xref, new_image_bytes)
+                images_replaced += 1
+            except Exception as e:
+                logger.warning(f"Failed to update image xref {xref}: {e}")
+                continue
+            finally:
+                pix = None  # تحرير الذاكرة
+
+    logger.info(f"Images replaced: {images_replaced}")
+
+    # حفظ الـ PDF بعد الضغط
+    out_buf = io.BytesIO()
+    doc.save(out_buf)  # ممكن إضافة خيارات أخرى لو أردت
+    doc.close()
+
+    compressed_bytes = out_buf.getvalue()
+    compressed_kb = round(len(compressed_bytes) / 1024)
+
+    return compressed_bytes, original_kb, compressed_kb
+
+
+@app.route("/")
 def index():
-    return jsonify({"status": "ok", "message": "Family compressor is running"})
+    return "Family compressor is running."
 
 
 @app.route("/compress", methods=["POST"])
-def compress_route():
-    """
-    يحاول أولاً قراءة ملف مرفوع باسم 'file'.
-    إذا لم يجده، يحاول قراءة 'fileUrl' (من form أو JSON) وتحميله بنفسه.
-    """
-
+def compress():
     try:
-        target_kb = None
-        # حجم الهدف (اختياري)
-        size_str = None
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({"success": False, "error": "No JSON body"}), 400
 
-        pdf_bytes = None
+        file_url = data.get("fileUrl")
+        target_kb = data.get("targetKB")  # يمكن أن يكون None
 
-        # --------- 1) حاول قراءة ملف مرفوع ---------
-        if "file" in request.files and request.files["file"].filename:
-            file_storage = request.files["file"]
-            pdf_bytes = file_storage.read()
-            logger.info(
-                "Received upload '%s', size=%d KB",
-                file_storage.filename,
-                len(pdf_bytes) // 1024,
-            )
-            size_str = request.form.get("size")
+        if not file_url:
+            return jsonify({"success": False, "error": "fileUrl is required"}), 400
 
-        # --------- 2) إن لم يوجد ملف، جرّب fileUrl ---------
-        if pdf_bytes is None:
-            # من form (multipart أو x-www-form-urlencoded)
-            file_url = request.form.get("fileUrl")
+        if target_kb is not None:
+            try:
+                target_kb = int(target_kb)
+            except ValueError:
+                target_kb = None
 
-            # أو من JSON
-            if not file_url and request.is_json:
-                data = request.get_json(silent=True) or {}
-                file_url = data.get("fileUrl")
+        logger.info(f"Downloading file: {file_url}")
+        pdf_bytes = download_file(file_url)
 
-            if not file_url:
-                return (
-                    jsonify(
-                        {
-                            "success": False,
-                            "error": "No file upload and no fileUrl provided",
-                        }
-                    ),
-                    400,
-                )
+        compressed_bytes, orig_kb, comp_kb = compress_pdf_images(pdf_bytes, target_kb)
 
-            logger.info("Downloading PDF from URL: %s", file_url)
-            r = requests.get(file_url, timeout=60)
-            if r.status_code != 200:
-                return (
-                    jsonify(
-                        {
-                            "success": False,
-                            "error": f"Failed to download file from URL, status={r.status_code}",
-                        }
-                    ),
-                    400,
-                )
-            pdf_bytes = r.content
+        # إذا لم يتحسن الحجم تقريباً، نرجع النسخة الأصلية
+        if comp_kb >= orig_kb * 0.98:
+            logger.info("Compressed file not significantly smaller; returning original.")
+            compressed_bytes = pdf_bytes
+            comp_kb = orig_kb
 
-            # حجم الهدف من form أو JSON
-            if not size_str:
-                size_str = request.form.get("size")
-            if not size_str and request.is_json:
-                data = request.get_json(silent=True) or {}
-                size_str = data.get("size")
+        pdf_b64 = base64.b64encode(compressed_bytes).decode("ascii")
 
-        # --------- تجهيز target_kb ---------
-        if size_str and str(size_str).isdigit():
-            target_kb = int(size_str)
-
-        compressed_bytes, orig_size, comp_size = compress_pdf(pdf_bytes, target_kb)
-
-        response = Response(compressed_bytes, mimetype="application/pdf")
-        response.headers["X-Original-Size-KB"] = str(orig_size // 1024)
-        response.headers["X-Compressed-Size-KB"] = str(comp_size // 1024)
-        return response
+        return jsonify({
+            "success": True,
+            "pdfBase64": pdf_b64,
+            "originalSizeKB": orig_kb,
+            "compressedSizeKB": comp_kb
+        })
 
     except Exception as e:
-        logger.exception("Error while compressing PDF")
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "error": f"Compression error: {str(e)}",
-                }
-            ),
-            500,
-        )
+        logger.exception("Compression error")
+        return jsonify({"success": False, "error": f"Compression error: {e}"}), 500
 
 
 if __name__ == "__main__":
     # للتجربة المحلية فقط
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000)
