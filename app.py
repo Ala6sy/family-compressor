@@ -9,10 +9,31 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ============================
+# بروفايلات الجودة / الضغط
+# ============================
+PROFILES = {
+    # جودة قليلة + ضغط كبير
+    "low_q_high_c":  {"zoom": 0.5, "quality": 55},
 
-def render_pdf_with_quality(pdf_bytes: bytes, jpg_quality: int, zoom: float = 1.0):
+    # جودة متوسطة + ضغط قليل
+    "med_q_low_c":   {"zoom": 0.9, "quality": 80},
+
+    # جودة متوسطة + ضغط كبير
+    "med_q_high_c":  {"zoom": 0.7, "quality": 65},
+
+    # جودة عالية + ضغط قليل
+    "high_q_low_c":  {"zoom": 1.0, "quality": 90},
+
+    # جودة عالية + ضغط متوسط
+    "high_q_med_c":  {"zoom": 0.9, "quality": 85},
+}
+
+
+def render_pdf_with_params(pdf_bytes: bytes, zoom: float, jpg_quality: int):
     """
-    يرندر كل صفحة كصورة JPEG بجودة محددة ثم يعيد تجميعها في PDF جديد.
+    يرندر كل صفحة في الـ PDF كصورة JPEG حسب zoom و jpg_quality
+    ثم يعيد تجميعها في PDF جديد.
     """
     src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
@@ -21,7 +42,7 @@ def render_pdf_with_quality(pdf_bytes: bytes, jpg_quality: int, zoom: float = 1.
 
     for page in src_doc:
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        # في PyMuPDF 1.24.9 اسم البراميتر هو jpg_quality
+        # انتبه: في PyMuPDF الكلمة المفتاحية هي jpg_quality
         img_bytes = pix.tobytes("jpeg", jpg_quality=jpg_quality)
 
         rect = fitz.Rect(0, 0, pix.width, pix.height)
@@ -32,88 +53,53 @@ def render_pdf_with_quality(pdf_bytes: bytes, jpg_quality: int, zoom: float = 1.
     return out_bytes, len(out_bytes) // 1024
 
 
-def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
+def compress_pdf_with_profile(pdf_bytes: bytes, profile_code: str):
     """
-    خوارزمية ضغط ذكية:
-    - لو ما في target_kb أو أكبر من الحجم الأصلي → نرجع الملف كما هو.
-    - غير ذلك: نعمل "بحث ثنائي" على جودة JPEG لنقترب من الحجم المطلوب قدر الإمكان.
+    يضغط الـ PDF باستخدام بروفايل جاهز من PROFILES.
     """
     original_size_kb = len(pdf_bytes) // 1024
-    logger.info("Original PDF size: %d KB, target=%s", original_size_kb, str(target_kb))
-
-    # لو ما في هدف، أو الهدف أكبر من الأصلي → لا تضغط
-    if (not target_kb) or target_kb <= 0 or target_kb >= original_size_kb:
-        logger.info("No need to compress, returning original PDF.")
+    if profile_code not in PROFILES:
+        # لو بروفايل غير معروف → نرجع الأصلي
+        logger.warning("Unknown profile '%s', returning original.", profile_code)
         return pdf_bytes, original_size_kb, original_size_kb
 
-    # نطاق الجودة المسموح: من 30 إلى 90
-    low_q = 30
-    high_q = 90
-
-    # نستخدم تكبير بسيط للوضوح (١.٢ تقريبًا ٨٦dpi بدل ٧٢dpi)
-    zoom = 1.2
-
-    best_bytes = None
-    best_size = None
-    best_diff = None
-
-    # نسمح بعدد محاولات محدود حتى لا يتأخر السيرفر
-    for _ in range(6):
-        q = (low_q + high_q) // 2
-        out_bytes, out_kb = render_pdf_with_quality(pdf_bytes, jpg_quality=q, zoom=zoom)
-
-        diff = abs(out_kb - target_kb)
-        logger.info(
-            "Try quality=%d → size=%d KB (target=%d KB, diff=%d)",
-            q, out_kb, target_kb, diff
-        )
-
-        # حفظ أفضل نتيجة حتى الآن
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            best_size = out_kb
-            best_bytes = out_bytes
-
-        # ضبط البحث الثنائي
-        if out_kb > target_kb * 1.05:
-            # الحجم أكبر من المطلوب → نخفّض الجودة
-            high_q = q - 1
-        elif out_kb < target_kb * 0.85:
-            # الحجم أصغر بكثير من المطلوب → نستطيع رفع الجودة
-            low_q = q + 1
-        else:
-            # داخل النطاق المقبول تقريباً → نوقف
-            break
-
-        if low_q > high_q:
-            break
-
-    # لو لأي سبب فشلنا في إنتاج ملف، نرجع الأصلي
-    if best_bytes is None:
-        logger.warning("Fell back to original PDF (no compressed candidate).")
-        return pdf_bytes, original_size_kb, original_size_kb
+    params = PROFILES[profile_code]
+    zoom = params["zoom"]
+    jpg_quality = params["quality"]
 
     logger.info(
-        "Best compressed size: %d KB (original %d KB, target %d KB)",
-        best_size, original_size_kb, target_kb
+        "Using profile %s -> zoom=%.2f, quality=%d (original=%d KB)",
+        profile_code, zoom, jpg_quality, original_size_kb
     )
-    return best_bytes, original_size_kb, best_size
+
+    compressed_bytes, compressed_kb = render_pdf_with_params(
+        pdf_bytes, zoom=zoom, jpg_quality=jpg_quality
+    )
+
+    logger.info(
+        "Compressed size: %d KB (original %d KB)",
+        compressed_kb, original_size_kb
+    )
+
+    return compressed_bytes, original_size_kb, compressed_kb
 
 
 @app.route("/")
 def index():
-    return "Family PDF compressor is running."
+    return "Family PDF compressor with profiles is running."
 
 
 @app.route("/compress", methods=["POST"])
 def compress_endpoint():
     """
     يستقبل:
-    - الملف تحت اسم الحقل 'file' (multipart/form-data)
-    - حقل اختياري 'size' للحجم المطلوب بالكيلوبايت
-    ويرجع JSON يحتوي:
+    - الملف في حقل 'file'
+    - حقل اختياري 'profile' يساوي أحد القيم:
+      low_q_high_c, med_q_low_c, med_q_high_c, high_q_low_c, high_q_med_c
+
+    يرجع JSON فيه:
     - success
-    - pdfBase64 : الملف المضغوط base64
+    - pdfBase64
     - originalSizeKB
     - compressedSizeKB
     """
@@ -125,18 +111,19 @@ def compress_endpoint():
                 "error": "No file part in request (expected field name 'file')"
             }), 400
 
-        size_str = (request.form.get("size") or "").strip()
-        target_kb = int(size_str) if size_str.isdigit() else None
+        profile = (request.form.get("profile") or "").strip()
 
         pdf_bytes = file_storage.read()
         logger.info(
-            "Received file '%s' (%d KB), target=%s",
+            "Received file '%s' (%d KB), profile=%s",
             file_storage.filename,
             len(pdf_bytes) // 1024,
-            str(target_kb)
+            profile or "NONE"
         )
 
-        compressed_bytes, orig_kb, comp_kb = compress_pdf(pdf_bytes, target_kb)
+        compressed_bytes, orig_kb, comp_kb = compress_pdf_with_profile(
+            pdf_bytes, profile
+        )
 
         return jsonify({
             "success": True,
@@ -154,5 +141,4 @@ def compress_endpoint():
 
 
 if __name__ == "__main__":
-    # للتجريب المحلي فقط
     app.run(host="0.0.0.0", port=10000, debug=True)
