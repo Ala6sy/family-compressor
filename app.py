@@ -57,7 +57,8 @@ def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
     for page_index, page in enumerate(doc):
         # تحويل الصفحة لصورة
         pix = page.get_pixmap(matrix=matrix, alpha=False)
-        img_bytes = pix.tobytes("jpeg", quality=jpeg_quality)
+        img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+
 
         # صفحة جديدة بحجم الصورة
         rect = fitz.Rect(0, 0, pix.width, pix.height)
@@ -135,3 +136,4 @@ def compress_endpoint():
 if __name__ == "__main__":
     # للتجربة المحلية فقط
     app.run(host="0.0.0.0", port=10000, debug=True)
+
