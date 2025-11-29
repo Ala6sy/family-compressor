@@ -1,135 +1,111 @@
-import os
+from flask import Flask, request, jsonify, Response
 import io
-import base64
 import logging
-
-import requests
-from flask import Flask, request, jsonify
 import pikepdf
 
 app = Flask(__name__)
 
-# إعداد اللوج
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# حد أقصى لحجم الملف اللي نسمح بتنزيله (ميغابايت)
-MAX_DOWNLOAD_MB = 15
 
-
-def download_file(url: str) -> bytes:
+def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
     """
-    ينزّل الملف من رابط Google Drive (أو أي رابط مباشر)
-    ويرجعه كـ bytes مع حد أقصى للحجم.
+    يقوم بضغط ملف PDF ببساطة عن طريق إعادة حفظه عبر pikepdf.
+    حالياً لا نستخدم optimize_streams لأن النسخة المثبتة لا تدعمه.
     """
-    logger.info(f"Downloading file from: {url}")
-    resp = requests.get(url, stream=True, timeout=25)
-    resp.raise_for_status()
 
-    buf = io.BytesIO()
-    total = 0
-    chunk_size = 64 * 1024  # 64 KB
-
-    for chunk in resp.iter_content(chunk_size):
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > MAX_DOWNLOAD_MB * 1024 * 1024:
-            raise ValueError(f"File too large (> {MAX_DOWNLOAD_MB} MB)")
-        buf.write(chunk)
-
-    logger.info(f"Downloaded {total} bytes")
-    return buf.getvalue()
-
-
-def compress_pdf(pdf_bytes: bytes, target_kb: int | float | None = None):
-    """
-    يضغط ملف PDF باستخدام pikepdf ويرجع:
-    (الملف المضغوط, حجم الأصلي, حجم المضغوط) بالبايت.
-    (الضغط هنا أساسي، بدون لعب مع الجودة كثيراً)
-    """
-    original_size = len(pdf_bytes)
-    logger.info(f"Original PDF size: {original_size} bytes")
+    orig_size = len(pdf_bytes)
 
     input_stream = io.BytesIO(pdf_bytes)
     output_stream = io.BytesIO()
 
-    # ضغط بسيط/قياسي
+    # نفتح الـ PDF عبر pikepdf ونحفظه من جديد
     with pikepdf.open(input_stream) as pdf:
-        pdf.save(
-            output_stream,
-            optimize_streams=True,
-            compress_streams=True
-        )
+        # في بعض نسخ pikepdf يوجد compress_streams، لكن لتفادي أي مشاكل
+        # سنستخدم الحفظ العادي فقط (ما زال فيه قدر من الضغط).
+        pdf.save(output_stream)  # لا نستخدم optimize_streams هنا
 
     compressed_bytes = output_stream.getvalue()
-    logger.info(f"Compressed PDF size: {len(compressed_bytes)} bytes")
+    comp_size = len(compressed_bytes)
 
-    # ممكن لاحقاً نضيف منطق تكرار وتحقيق target_kb لو حابب
-    return compressed_bytes, original_size, len(compressed_bytes)
+    logger.info(
+        "Compression done: original=%d KB, compressed=%d KB",
+        orig_size // 1024,
+        comp_size // 1024,
+    )
+
+    return compressed_bytes, orig_size, comp_size
 
 
 @app.route("/", methods=["GET"])
 def index():
-    return "family-compressor is alive"
+    return jsonify({"status": "ok", "message": "Family compressor is running"})
 
 
 @app.route("/compress", methods=["POST"])
-def compress_endpoint():
+def compress_route():
     """
-    يستقبل JSON من Apps Script بالشكل:
-    {
-      "fileUrl": "https://drive.google.com/uc?export=download&id=...",
-      "targetKB": 400   // اختياري
-    }
+    يستقبل:
+      - file: ملف PDF القادم من Google Apps Script (UrlFetchApp)
+      - size (اختياري): الحجم المطلوب تقريباً بالكيلوبايت، حالياً فقط للمستقبل
+
     ويرجع:
-    {
-      "success": true,
-      "originalSizeKB": ...,
-      "compressedSizeKB": ...,
-      "pdfBase64": "...."
-    }
+      - PDF مضغوط مباشرة (binary) مع Content-Type = application/pdf
+      - في حالة الخطأ يرجع JSON مع status 500
     """
     try:
-        data = request.get_json(force=True, silent=False)
-    except Exception as e:
-        logger.exception("Invalid JSON body")
-        return jsonify(success=False, error=f"Invalid JSON: {e}"), 400
+        if "file" not in request.files:
+            return (
+                jsonify(
+                    {
+                        "success": False,
+                        "error": "No file part in request (expected field name 'file')",
+                    }
+                ),
+                400,
+            )
 
-    if not isinstance(data, dict):
-        return jsonify(success=False, error="Body must be a JSON object"), 400
+        file_storage = request.files["file"]
+        pdf_bytes = file_storage.read()
 
-    file_url = data.get("fileUrl") or data.get("url")
-    target_kb = data.get("targetKB") or data.get("target_kb") or 0
+        if not pdf_bytes:
+            return jsonify({"success": False, "error": "Empty file"}), 400
 
-    if not file_url:
-        return jsonify(success=False, error="fileUrl is required"), 400
+        # الحجم المطلوب (حالياً غير مستخدم بقوة، لكن نمرره للدالة لو احتجناه لاحقاً)
+        size_str = request.form.get("size")
+        target_kb = int(size_str) if size_str and size_str.isdigit() else None
 
-    try:
-        pdf_bytes = download_file(file_url)
-    except Exception as e:
-        logger.exception("Download failed")
-        return jsonify(success=False, error=f"Download error: {e}"), 500
+        logger.info(
+            "Received file '%s', size=%d KB, target_kb=%s",
+            file_storage.filename,
+            len(pdf_bytes) // 1024,
+            target_kb,
+        )
 
-    try:
         compressed_bytes, orig_size, comp_size = compress_pdf(pdf_bytes, target_kb)
+
+        # نرجع الـ PDF المضغوط مباشرة كـ binary response
+        response = Response(compressed_bytes, mimetype="application/pdf")
+        # ممكن نضيف بعض الهيدرز للمعلومية فقط
+        response.headers["X-Original-Size-KB"] = str(orig_size // 1024)
+        response.headers["X-Compressed-Size-KB"] = str(comp_size // 1024)
+
+        return response
+
     except Exception as e:
-        logger.exception("Compression failed")
-        return jsonify(success=False, error=f"Compression error: {e}"), 500
-
-    # تحويل النتيجة إلى base64 ليرجعها لـ Apps Script
-    pdf_b64 = base64.b64encode(compressed_bytes).decode("ascii")
-
-    resp = {
-        "success": True,
-        "originalSizeKB": round(orig_size / 1024),
-        "compressedSizeKB": round(comp_size / 1024),
-        "pdfBase64": pdf_b64,
-    }
-    return jsonify(resp)
+        logger.exception("Error while compressing PDF")
+        return (
+            jsonify(
+                {
+                    "success": False,
+                    "error": f"Compression error: {str(e)}",
+                }
+            ),
+            500,
+        )
 
 
 if __name__ == "__main__":
-    # Render يعطي PORT في متغير بيئة
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    # للتجربة المحلية فقط
+    app.run(host="0.0.0.0", port=5000, debug=True)
