@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, Response
 import io
 import logging
 import pikepdf
+import requests  # لتحميل الملف من الرابط عند الحاجة
 
 app = Flask(__name__)
 
@@ -11,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
     """
-    يقوم بضغط ملف PDF ببساطة عن طريق إعادة حفظه عبر pikepdf.
-    حالياً لا نستخدم optimize_streams لأن النسخة المثبتة لا تدعمه.
+    ضغط PDF بسيط عن طريق إعادة حفظه عبر pikepdf.
+    لا نستخدم optimize_streams لأن النسخة الحالية لا تدعمه.
     """
 
     orig_size = len(pdf_bytes)
@@ -20,11 +21,9 @@ def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
     input_stream = io.BytesIO(pdf_bytes)
     output_stream = io.BytesIO()
 
-    # نفتح الـ PDF عبر pikepdf ونحفظه من جديد
     with pikepdf.open(input_stream) as pdf:
-        # في بعض نسخ pikepdf يوجد compress_streams، لكن لتفادي أي مشاكل
-        # سنستخدم الحفظ العادي فقط (ما زال فيه قدر من الضغط).
-        pdf.save(output_stream)  # لا نستخدم optimize_streams هنا
+        # حفظ عادي (فيه بعض الضغط تلقائياً)
+        pdf.save(output_stream)
 
     compressed_bytes = output_stream.getvalue()
     comp_size = len(compressed_bytes)
@@ -46,51 +45,79 @@ def index():
 @app.route("/compress", methods=["POST"])
 def compress_route():
     """
-    يستقبل:
-      - file: ملف PDF القادم من Google Apps Script (UrlFetchApp)
-      - size (اختياري): الحجم المطلوب تقريباً بالكيلوبايت، حالياً فقط للمستقبل
-
-    ويرجع:
-      - PDF مضغوط مباشرة (binary) مع Content-Type = application/pdf
-      - في حالة الخطأ يرجع JSON مع status 500
+    يحاول أولاً قراءة ملف مرفوع باسم 'file'.
+    إذا لم يجده، يحاول قراءة 'fileUrl' (من form أو JSON) وتحميله بنفسه.
     """
+
     try:
-        if "file" not in request.files:
-            return (
-                jsonify(
-                    {
-                        "success": False,
-                        "error": "No file part in request (expected field name 'file')",
-                    }
-                ),
-                400,
+        target_kb = None
+        # حجم الهدف (اختياري)
+        size_str = None
+
+        pdf_bytes = None
+
+        # --------- 1) حاول قراءة ملف مرفوع ---------
+        if "file" in request.files and request.files["file"].filename:
+            file_storage = request.files["file"]
+            pdf_bytes = file_storage.read()
+            logger.info(
+                "Received upload '%s', size=%d KB",
+                file_storage.filename,
+                len(pdf_bytes) // 1024,
             )
+            size_str = request.form.get("size")
 
-        file_storage = request.files["file"]
-        pdf_bytes = file_storage.read()
+        # --------- 2) إن لم يوجد ملف، جرّب fileUrl ---------
+        if pdf_bytes is None:
+            # من form (multipart أو x-www-form-urlencoded)
+            file_url = request.form.get("fileUrl")
 
-        if not pdf_bytes:
-            return jsonify({"success": False, "error": "Empty file"}), 400
+            # أو من JSON
+            if not file_url and request.is_json:
+                data = request.get_json(silent=True) or {}
+                file_url = data.get("fileUrl")
 
-        # الحجم المطلوب (حالياً غير مستخدم بقوة، لكن نمرره للدالة لو احتجناه لاحقاً)
-        size_str = request.form.get("size")
-        target_kb = int(size_str) if size_str and size_str.isdigit() else None
+            if not file_url:
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": "No file upload and no fileUrl provided",
+                        }
+                    ),
+                    400,
+                )
 
-        logger.info(
-            "Received file '%s', size=%d KB, target_kb=%s",
-            file_storage.filename,
-            len(pdf_bytes) // 1024,
-            target_kb,
-        )
+            logger.info("Downloading PDF from URL: %s", file_url)
+            r = requests.get(file_url, timeout=60)
+            if r.status_code != 200:
+                return (
+                    jsonify(
+                        {
+                            "success": False,
+                            "error": f"Failed to download file from URL, status={r.status_code}",
+                        }
+                    ),
+                    400,
+                )
+            pdf_bytes = r.content
+
+            # حجم الهدف من form أو JSON
+            if not size_str:
+                size_str = request.form.get("size")
+            if not size_str and request.is_json:
+                data = request.get_json(silent=True) or {}
+                size_str = data.get("size")
+
+        # --------- تجهيز target_kb ---------
+        if size_str and str(size_str).isdigit():
+            target_kb = int(size_str)
 
         compressed_bytes, orig_size, comp_size = compress_pdf(pdf_bytes, target_kb)
 
-        # نرجع الـ PDF المضغوط مباشرة كـ binary response
         response = Response(compressed_bytes, mimetype="application/pdf")
-        # ممكن نضيف بعض الهيدرز للمعلومية فقط
         response.headers["X-Original-Size-KB"] = str(orig_size // 1024)
         response.headers["X-Compressed-Size-KB"] = str(comp_size // 1024)
-
         return response
 
     except Exception as e:
