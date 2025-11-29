@@ -10,73 +10,94 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
+def render_pdf_with_quality(pdf_bytes: bytes, jpg_quality: int, zoom: float = 1.0):
     """
-    ضغط PDF عن طريق:
-      - تحويل كل صفحة لصورة (raster)
-      - تقليل الدقة (zoom) + جودة JPEG
-
-    target_kb: الحجم المطلوب تقريباً بالكيلوبايت (ليس دقيق 100% لكنه قريب).
-    يرجع: (compressed_bytes, original_size_kb, compressed_size_kb)
+    يرندر كل صفحة كصورة JPEG بجودة محددة ثم يعيد تجميعها في PDF جديد.
     """
-    # الحجم الأصلي
-    original_size_kb = max(1, len(pdf_bytes) // 1024)
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
 
-    # حساب zoom بناءً على النسبة المطلوبة في الحجم
-    if target_kb is not None and target_kb > 0:
-        # نسبة الحجم المطلوب إلى الحجم الأصلي (0–1)
-        desired_ratio = min(1.0, target_kb / float(original_size_kb))
+    mat = fitz.Matrix(zoom, zoom)
 
-        # لأن الحجم يتناسب مع المساحة (≈ zoom^2)
-        # نأخذ الجذر التربيعي حتى يكون تأثير zoom منطقي
-        zoom = desired_ratio ** 0.5
+    for page in src_doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        # في PyMuPDF 1.24.9 اسم البراميتر هو jpg_quality
+        img_bytes = pix.tobytes("jpeg", jpg_quality=jpg_quality)
 
-        # لا نسمح أن يكون صغير جداً أو أكبر من 1
-        zoom = max(0.35, min(1.0, zoom))
-    else:
-        # لو ما أُرسل هدف → ضغط متوسط
-        zoom = 0.6
-
-    # جودة JPEG تربط بالـ zoom (كلما كبر zoom نرفع الجودة)
-    jpeg_quality = int(45 + 35 * zoom)  # تقريباً من 45 إلى 80
-    jpeg_quality = max(40, min(90, jpeg_quality))
-
-    logger.info(
-        "Compressing PDF: original=%d KB, target=%s KB, zoom=%.2f, jpeg_quality=%d",
-        original_size_kb,
-        str(target_kb),
-        zoom,
-        jpeg_quality,
-    )
-
-    matrix = fitz.Matrix(zoom, zoom)
-
-    for page_index, page in enumerate(doc):
-        # تحويل الصفحة لصورة
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
-
-
-        # صفحة جديدة بحجم الصورة
         rect = fitz.Rect(0, 0, pix.width, pix.height)
         new_page = out_doc.new_page(width=rect.width, height=rect.height)
-
-        # إدراج الصورة داخل الصفحة
         new_page.insert_image(rect, stream=img_bytes)
 
-    compressed_bytes = out_doc.tobytes()
-    compressed_size_kb = max(1, len(compressed_bytes) // 1024)
+    out_bytes = out_doc.tobytes()
+    return out_bytes, len(out_bytes) // 1024
+
+
+def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
+    """
+    خوارزمية ضغط ذكية:
+    - لو ما في target_kb أو أكبر من الحجم الأصلي → نرجع الملف كما هو.
+    - غير ذلك: نعمل "بحث ثنائي" على جودة JPEG لنقترب من الحجم المطلوب قدر الإمكان.
+    """
+    original_size_kb = len(pdf_bytes) // 1024
+    logger.info("Original PDF size: %d KB, target=%s", original_size_kb, str(target_kb))
+
+    # لو ما في هدف، أو الهدف أكبر من الأصلي → لا تضغط
+    if (not target_kb) or target_kb <= 0 or target_kb >= original_size_kb:
+        logger.info("No need to compress, returning original PDF.")
+        return pdf_bytes, original_size_kb, original_size_kb
+
+    # نطاق الجودة المسموح: من 30 إلى 90
+    low_q = 30
+    high_q = 90
+
+    # نستخدم تكبير بسيط للوضوح (١.٢ تقريبًا ٨٦dpi بدل ٧٢dpi)
+    zoom = 1.2
+
+    best_bytes = None
+    best_size = None
+    best_diff = None
+
+    # نسمح بعدد محاولات محدود حتى لا يتأخر السيرفر
+    for _ in range(6):
+        q = (low_q + high_q) // 2
+        out_bytes, out_kb = render_pdf_with_quality(pdf_bytes, jpg_quality=q, zoom=zoom)
+
+        diff = abs(out_kb - target_kb)
+        logger.info(
+            "Try quality=%d → size=%d KB (target=%d KB, diff=%d)",
+            q, out_kb, target_kb, diff
+        )
+
+        # حفظ أفضل نتيجة حتى الآن
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_size = out_kb
+            best_bytes = out_bytes
+
+        # ضبط البحث الثنائي
+        if out_kb > target_kb * 1.05:
+            # الحجم أكبر من المطلوب → نخفّض الجودة
+            high_q = q - 1
+        elif out_kb < target_kb * 0.85:
+            # الحجم أصغر بكثير من المطلوب → نستطيع رفع الجودة
+            low_q = q + 1
+        else:
+            # داخل النطاق المقبول تقريباً → نوقف
+            break
+
+        if low_q > high_q:
+            break
+
+    # لو لأي سبب فشلنا في إنتاج ملف، نرجع الأصلي
+    if best_bytes is None:
+        logger.warning("Fell back to original PDF (no compressed candidate).")
+        return pdf_bytes, original_size_kb, original_size_kb
 
     logger.info(
-        "Compressed size: %d KB (original %d KB)",
-        compressed_size_kb,
-        original_size_kb,
+        "Best compressed size: %d KB (original %d KB, target %d KB)",
+        best_size, original_size_kb, target_kb
     )
-
-    return compressed_bytes, original_size_kb, compressed_size_kb
+    return best_bytes, original_size_kb, best_size
 
 
 @app.route("/")
@@ -88,14 +109,13 @@ def index():
 def compress_endpoint():
     """
     يستقبل:
-      - الملف في الحقل 'file' (multipart/form-data)
-      - حقل اختياري 'size' للحجم المطلوب بالكيلوبايت
-
+    - الملف تحت اسم الحقل 'file' (multipart/form-data)
+    - حقل اختياري 'size' للحجم المطلوب بالكيلوبايت
     ويرجع JSON يحتوي:
-      - success
-      - pdfBase64        : الملف المضغوط base64
-      - originalSizeKB   : حجم الأصلي بالكيلوبايت
-      - compressedSizeKB : حجم المضغوط بالكيلوبايت
+    - success
+    - pdfBase64 : الملف المضغوط base64
+    - originalSizeKB
+    - compressedSizeKB
     """
     try:
         file_storage = request.files.get("file")
@@ -134,6 +154,5 @@ def compress_endpoint():
 
 
 if __name__ == "__main__":
-    # للتجربة المحلية فقط
+    # للتجريب المحلي فقط
     app.run(host="0.0.0.0", port=10000, debug=True)
-
