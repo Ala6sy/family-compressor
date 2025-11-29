@@ -1,6 +1,5 @@
 import base64
 import logging
-import io
 
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
@@ -16,7 +15,7 @@ def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
     ضغط PDF عن طريق:
     - تحويل كل صفحة إلى صورة (raster)
     - تخفيض الدقة (zoom) وجودة JPEG
-    هذا ممتاز لملفات الجواز/المسح الضوئي (scan).
+    مناسب جداً لملفات الجواز / السكانر.
 
     :param pdf_bytes: محتوى الـ PDF الأصلي
     :param target_kb: الحجم المطلوب تقريباً بالكيلوبايت (يمكن تركه None)
@@ -53,7 +52,8 @@ def compress_pdf(pdf_bytes: bytes, target_kb: int | None = None):
     for page_index, page in enumerate(doc):
         # حوّل الصفحة إلى صورة
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes("jpeg", quality=jpeg_quality)
+        # هنا كان الخطأ: الكلمة الصحيحة jpg_quality
+        img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
 
         # أنشئ صفحة جديدة بالحجم المناسب
         rect = fitz.Rect(0, 0, pix.width, pix.height)
@@ -85,6 +85,7 @@ def compress_endpoint():
     يستقبل:
     - الملف تحت اسم الحقل 'file' (multipart/form-data)
     - حقل اختياري 'size' للحجم المطلوب بالكيلوبايت
+
     ويرجع JSON يحتوي:
     - success
     - pdfBase64 : الملف المضغوط base64
