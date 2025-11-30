@@ -1,5 +1,6 @@
 import base64
 import logging
+import io
 
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
@@ -10,73 +11,58 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# -------------------------
-# بروفايلات الجودة والضغط
-# -------------------------
-PROFILES = {
-    # جودة قليلة + ضغط قوي (أصغر حجم – تشويش أعلى)
-    "low_q_high_c": {
-        "zoom": 0.4,   # دقة الصورة
-        "jpeg": 45     # جودة JPEG
-    },
-    # جودة متوسطة + ضغط قليل (ملف أصغر بقليل مع وضوح جيد)
-    "med_q_low_c": {
-        "zoom": 0.8,
-        "jpeg": 80
-    },
-    # جودة متوسطة + ضغط قوي (توازن بين الحجم والوضوح)
-    "med_q_high_c": {
-        "zoom": 0.6,
-        "jpeg": 60
-    },
-    # جودة عالية + ضغط قليل (أفضل وضوح – حجم قريب من الأصلي)
-    "high_q_low_c": {
-        "zoom": 1.0,
-        "jpeg": 90
-    },
-    # جودة عالية + ضغط متوسط (توازن مقبول مع وضوح ممتاز)
-    "high_q_med_c": {
-        "zoom": 0.9,
-        "jpeg": 80
-    }
-}
-
-DEFAULT_PROFILE = "med_q_high_c"
-
-
-def compress_pdf(pdf_bytes: bytes, profile_name: str):
+def get_compression_params(mode: str):
     """
-    ضغط PDF عن طريق تحويل الصفحات إلى صور JPEG
-    حسب إعدادات البروفايل (zoom + jpeg quality).
+    ثلاثة مستويات مثل iLovePDF تقريباً:
+
+    - extreme  : ضغط شديد (جودة أقل، حجم أصغر)
+    - recommended : موصى به (توازن بين الجودة والحجم)
+    - low : ضغط أقل (جودة أعلى، ملف أكبر قليلاً)
+    """
+    mode = (mode or "recommended").lower()
+
+    if mode == "extreme":
+        # جودة أقل، ضغط أعلى
+        zoom = 0.55         # تصغير الأبعاد
+        jpeg_quality = 45   # جودة JPEG
+    elif mode == "low":
+        # جودة عالية تقريباً، ضغط خفيف
+        zoom = 0.95
+        jpeg_quality = 80
+    else:
+        # recommended
+        zoom = 0.75
+        jpeg_quality = 60
+
+    return zoom, jpeg_quality
+
+
+def compress_pdf(pdf_bytes: bytes, mode: str = "recommended"):
+    """
+    ضغط PDF بتحويل الصفحات إلى صور مع التحكم في:
+    - zoom (الدقة)
+    - jpeg_quality (جودة الصورة)
     """
     original_size_kb = len(pdf_bytes) // 1024
 
-    profile = PROFILES.get(profile_name, PROFILES[DEFAULT_PROFILE])
-    zoom = profile["zoom"]
-    jpeg_quality = profile["jpeg"]
-
-    logger.info(
-        "Compressing PDF: profile=%s, zoom=%.2f, jpeg_quality=%d, original=%d KB",
-        profile_name, zoom, jpeg_quality, original_size_kb
-    )
-
-    # افتح الـ PDF من bytes
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out_doc = fitz.open()
+
+    zoom, jpeg_quality = get_compression_params(mode)
+
+    logger.info(
+        "Compressing PDF: original=%d KB, mode=%s, zoom=%.2f, jpeg_quality=%d",
+        original_size_kb, mode, zoom, jpeg_quality
+    )
 
     mat = fitz.Matrix(zoom, zoom)
 
     for page_index, page in enumerate(doc):
-        # تحويل الصفحة إلى صورة
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        # انتبه: في PyMuPDF لا نستخدم keyword "quality"، فقط قيمة رقمية
-        img_bytes = pix.tobytes("jpeg", jpeg_quality)
+        img_bytes = pix.tobytes("jpeg", quality=jpeg_quality)
 
-        # إنشاء صفحة جديدة بحجم الصورة
         rect = fitz.Rect(0, 0, pix.width, pix.height)
         new_page = out_doc.new_page(width=rect.width, height=rect.height)
-
-        # إدراج الصورة داخل الصفحة
         new_page.insert_image(rect, stream=img_bytes)
 
     compressed_bytes = out_doc.tobytes()
@@ -99,13 +85,13 @@ def index():
 def compress_endpoint():
     """
     يستقبل:
-      - الملف في الحقل 'file'
-      - البروفايل في الحقل 'profile'
-    ويرجع:
-      - success
-      - pdfBase64
-      - originalSizeKB
-      - compressedSizeKB
+    - الملف تحت اسم الحقل 'file' (multipart/form-data)
+    - حقل 'mode' قيمته: extreme / recommended / low
+    ويرجع JSON يحتوي:
+    - success
+    - pdfBase64
+    - originalSizeKB
+    - compressedSizeKB
     """
     try:
         file_storage = request.files.get("file")
@@ -115,19 +101,17 @@ def compress_endpoint():
                 "error": "No file part in request (expected field name 'file')"
             }), 400
 
-        profile = (request.form.get("profile") or "").strip()
-        if profile == "":
-            profile = DEFAULT_PROFILE
+        mode = request.form.get("mode", "recommended")
 
         pdf_bytes = file_storage.read()
         logger.info(
-            "Received file '%s' (%d KB), profile=%s",
+            "Received file '%s' (%d KB), mode=%s",
             file_storage.filename,
             len(pdf_bytes) // 1024,
-            profile
+            mode
         )
 
-        compressed_bytes, orig_kb, comp_kb = compress_pdf(pdf_bytes, profile)
+        compressed_bytes, orig_kb, comp_kb = compress_pdf(pdf_bytes, mode)
 
         return jsonify({
             "success": True,
