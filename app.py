@@ -3,6 +3,7 @@ import logging
 import io
 
 from flask import Flask, request, jsonify
+import requests
 import fitz  # PyMuPDF
 from PIL import Image  # Pillow
 
@@ -14,8 +15,6 @@ app = Flask(__name__)
 
 def get_mode_params(mode: str):
     mode = (mode or "").strip().lower()
-
-    # للـ PDF (تحويل الصفحات إلى صور)
     if mode == "high_compression":
         return 0.6, 45
     elif mode == "low_compression":
@@ -35,9 +34,6 @@ def get_image_quality(mode: str):
 
 
 def compress_pdf(pdf_bytes: bytes, mode: str):
-    """
-    ضغط PDF: تحويل كل صفحة إلى صورة JPG مضغوطة ثم تجميعها في PDF جديد.
-    """
     zoom, jpeg_quality = get_mode_params(mode)
     logger.info(
         f"Trying PDF compression: mode={mode}, zoom={zoom}, jpeg_quality={jpeg_quality}"
@@ -45,7 +41,6 @@ def compress_pdf(pdf_bytes: bytes, mode: str):
 
     original_size_kb = round(len(pdf_bytes) / 1024)
 
-    # لو ليس PDF حقيقي سيرمي fitz.open استثناء "is no PDF"
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     new_doc = fitz.open()
 
@@ -53,14 +48,14 @@ def compress_pdf(pdf_bytes: bytes, mode: str):
         page = doc.load_page(page_index)
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-
         img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
 
         img_doc = fitz.open("jpeg", img_bytes)
         img_page = img_doc[0]
 
         new_page = new_doc.new_page(
-            width=img_page.rect.width, height=img_page.rect.height
+            width=img_page.rect.width,
+            height=img_page.rect.height,
         )
         new_page.show_pdf_page(new_page.rect, img_doc, 0)
         img_doc.close()
@@ -81,9 +76,6 @@ def compress_pdf(pdf_bytes: bytes, mode: str):
 
 
 def compress_image(image_bytes: bytes, mode: str):
-    """
-    ضغط صورة (JPG/PNG/..) وتحويلها إلى JPG مضغوط.
-    """
     jpeg_quality = get_image_quality(mode)
     logger.info(
         f"Using IMAGE compression: mode={mode}, jpeg_quality={jpeg_quality}"
@@ -117,46 +109,67 @@ def health():
 @app.route("/compress", methods=["POST"])
 def compress_endpoint():
     """
-    يستقبل:
-      - file: ملف (PDF أو صورة) من Apps Script
-      - mode: high_compression / recommended / low_compression
-
-    يحاول أولاً ضغطه على أنه PDF،
-    ولو فشل (is no PDF) ينتقل تلقائياً لضغط الصور.
+    يستقبل JSON من Apps Script:
+      {
+        "mode": "recommended",
+        "fileUrl": "https://drive.google.com/uc?export=download&id=..."
+        "fileType": "application/pdf" أو image/...
+      }
     """
     try:
-        if "file" not in request.files:
+        data = request.get_json(force=True)
+        if not data:
             return (
-                jsonify({"success": False, "error": "No file part in request"}),
+                jsonify({"success": False, "error": "No JSON body"}),
                 400,
             )
 
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"success": False, "error": "Empty filename"}), 400
+        file_url = data.get("fileUrl")
+        mode = data.get("mode", "recommended")
+        hinted_type = data.get("fileType", "")
 
-        mode = request.form.get("mode", "recommended")
-        # نوع الملف القادم من Apps Script (قد يكون مفيد للتشخيص)
-        file_type = request.form.get("fileType") or file.mimetype or ""
-        file_bytes = file.read()
+        if not file_url:
+            return jsonify({"success": False, "error": "fileUrl is required"}), 400
 
         logger.info(
-            f"Received file, mode={mode}, type={file_type}, size={len(file_bytes)} bytes"
+            f"Downloading file from Drive: url={file_url}, hinted_type={hinted_type}, mode={mode}"
         )
 
-        # 1) جرّب كـ PDF أولاً
+        # تحميل الملف من Google Drive
+        r = requests.get(file_url, stream=True)
+        r.raise_for_status()
+        file_bytes = r.content
+        header_type = r.headers.get("Content-Type", "")
+        logger.info(
+            f"Downloaded {len(file_bytes)} bytes, header_type={header_type}"
+        )
+
+        # تحديد النوع الفعلي
+        file_type = hinted_type or header_type or ""
+        file_type = file_type.lower()
+
+        # محاولة PDF أولاً لو يبدو PDF
+        try_pdf = False
+        if file_bytes.startswith(b"%PDF"):
+            try_pdf = True
+        elif "pdf" in file_type:
+            try_pdf = True
+
         try:
-            (
-                compressed_bytes,
-                original_kb,
-                compressed_kb,
-                out_mime,
-                out_ext,
-            ) = compress_pdf(file_bytes, mode)
-            logger.info("PDF compression succeeded")
+            if try_pdf:
+                (
+                    compressed_bytes,
+                    original_kb,
+                    compressed_kb,
+                    out_mime,
+                    out_ext,
+                ) = compress_pdf(file_bytes, mode)
+                logger.info("PDF compression succeeded")
+            else:
+                raise ValueError("Not treating as PDF; trying image path")
+
         except Exception as pdf_err:
-            # لو ليس PDF حقيقي، جرّب ضغط الصور
-            logger.warning(f"PDF compression failed ({pdf_err}), trying image mode...")
+            logger.warning(f"PDF compression failed ({pdf_err}), trying image...")
             try:
                 (
                     compressed_bytes,
