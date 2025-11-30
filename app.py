@@ -1,209 +1,137 @@
 import base64
-import logging
 import io
+import logging
+import os
 
 from flask import Flask, request, jsonify
-import requests
 import fitz  # PyMuPDF
-from PIL import Image  # Pillow
+from PIL import Image
+
+app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
 
-
-def get_mode_params(mode: str):
-    mode = (mode or "").strip().lower()
+def get_mode_settings(mode: str):
+    """تحويل اسم النمط إلى إعدادات التكبير وجودة JPEG."""
+    mode = (mode or "recommended").strip()
     if mode == "high_compression":
         return 0.6, 45
-    elif mode == "low_compression":
+    if mode == "low_compression":
         return 1.0, 75
-    else:
-        return 0.8, 60  # recommended
+    # default = recommended
+    return 0.8, 60
 
 
-def get_image_quality(mode: str):
-    mode = (mode or "").strip().lower()
-    if mode == "high_compression":
-        return 40
-    elif mode == "low_compression":
-        return 80
-    else:
-        return 60
+def compress_bytes(file_bytes: bytes, file_type: str, mode: str):
+    """
+    تضغط PDF أو صورة (JPG/PNG) حسب نوع الملف.
+    ترجع: (out_bytes, original_kb, compressed_kb, output_mime, output_ext)
+    """
+    zoom, jpeg_quality = get_mode_settings(mode)
+    original_kb = max(1, len(file_bytes) // 1024)
+    file_type = (file_type or "").lower()
 
+    # نحاول أولاً كـ PDF لو كان النوع يشير لذلك
+    if "pdf" in file_type:
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+        except Exception as e:
+            raise ValueError(f"PDF error: {e}")
 
-def compress_pdf(pdf_bytes: bytes, mode: str):
-    zoom, jpeg_quality = get_mode_params(mode)
-    logger.info(
-        f"Trying PDF compression: mode={mode}, zoom={zoom}, jpeg_quality={jpeg_quality}"
-    )
-
-    original_size_kb = round(len(pdf_bytes) / 1024)
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    new_doc = fitz.open()
-
-    for page_index in range(len(doc)):
-        page = doc.load_page(page_index)
         mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+        out_pdf = fitz.open()
 
-        img_doc = fitz.open("jpeg", img_bytes)
-        img_page = img_doc[0]
+        try:
+            for page in doc:
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-        new_page = new_doc.new_page(
-            width=img_page.rect.width,
-            height=img_page.rect.height,
-        )
-        new_page.show_pdf_page(new_page.rect, img_doc, 0)
-        img_doc.close()
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+                img_bytes = buf.getvalue()
 
-    compressed_bytes = new_doc.write()
-    new_doc.close()
-    doc.close()
+                img_doc = fitz.open("jpeg", img_bytes)
+                out_pdf.insert_pdf(img_doc)
 
-    compressed_size_kb = round(len(compressed_bytes) / 1024)
+            out_bytes = out_pdf.tobytes()
+        finally:
+            out_pdf.close()
+            doc.close()
 
-    return (
-        compressed_bytes,
-        original_size_kb,
-        compressed_size_kb,
-        "application/pdf",
-        ".pdf",
-    )
+        compressed_kb = max(1, len(out_bytes) // 1024)
+        return out_bytes, original_kb, compressed_kb, "application/pdf", ".pdf"
 
+    # غير PDF → نعاملها كصورة (JPG/PNG...)
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+    except Exception as e:
+        raise ValueError(f"IMAGE error: {e}")
 
-def compress_image(image_bytes: bytes, mode: str):
-    jpeg_quality = get_image_quality(mode)
-    logger.info(
-        f"Using IMAGE compression: mode={mode}, jpeg_quality={jpeg_quality}"
-    )
-
-    original_size_kb = round(len(image_bytes) / 1024)
-
-    img = Image.open(io.BytesIO(image_bytes))
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
+    img = img.convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
-    compressed_bytes = buf.getvalue()
-    compressed_size_kb = round(len(compressed_bytes) / 1024)
-
-    return (
-        compressed_bytes,
-        original_size_kb,
-        compressed_size_kb,
-        "image/jpeg",
-        ".jpg",
-    )
-
-
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "message": "Family compressor API is running"})
+    out_bytes = buf.getvalue()
+    compressed_kb = max(1, len(out_bytes) // 1024)
+    return out_bytes, original_kb, compressed_kb, "image/jpeg", ".jpg"
 
 
 @app.route("/compress", methods=["POST"])
 def compress_endpoint():
     """
-    يستقبل JSON من Apps Script:
-      {
-        "mode": "recommended",
-        "fileUrl": "https://drive.google.com/uc?export=download&id=..."
-        "fileType": "application/pdf" أو image/...
-      }
+    يستقبل:
+      - file (multipart/form-data)
+      - mode: high_compression / recommended / low_compression
+      - fileType: نوع الملف الأصلي (مثل application/pdf أو image/jpeg)
     """
     try:
-        data = request.get_json(force=True)
-        if not data:
-            return (
-                jsonify({"success": False, "error": "No JSON body"}),
-                400,
-            )
+        if "file" not in request.files:
+            return jsonify(success=False, error="No file field 'file' in request"), 400
 
-        file_url = data.get("fileUrl")
-        mode = data.get("mode", "recommended")
-        hinted_type = data.get("fileType", "")
+        up_file = request.files["file"]
+        mode = request.form.get("mode", "recommended")
+        file_type = request.form.get("fileType", "")
 
-        if not file_url:
-            return jsonify({"success": False, "error": "fileUrl is required"}), 400
+        file_bytes = up_file.read()
+        if not file_bytes:
+            return jsonify(success=False, error="Empty file"), 400
 
         logger.info(
-            f"Downloading file from Drive: url={file_url}, hinted_type={hinted_type}, mode={mode}"
+            "Received file size=%d bytes, type=%s, mode=%s",
+            len(file_bytes),
+            file_type,
+            mode,
         )
 
-        # تحميل الملف من Google Drive
-        r = requests.get(file_url, stream=True)
-        r.raise_for_status()
-        file_bytes = r.content
-        header_type = r.headers.get("Content-Type", "")
-        logger.info(
-            f"Downloaded {len(file_bytes)} bytes, header_type={header_type}"
+        out_bytes, orig_kb, comp_kb, out_mime, out_ext = compress_bytes(
+            file_bytes, file_type, mode
         )
 
-        # تحديد النوع الفعلي
-        file_type = hinted_type or header_type or ""
-        file_type = file_type.lower()
-
-        # محاولة PDF أولاً لو يبدو PDF
-        try_pdf = False
-        if file_bytes.startswith(b"%PDF"):
-            try_pdf = True
-        elif "pdf" in file_type:
-            try_pdf = True
-
-        try:
-            if try_pdf:
-                (
-                    compressed_bytes,
-                    original_kb,
-                    compressed_kb,
-                    out_mime,
-                    out_ext,
-                ) = compress_pdf(file_bytes, mode)
-                logger.info("PDF compression succeeded")
-            else:
-                raise ValueError("Not treating as PDF; trying image path")
-
-        except Exception as pdf_err:
-            logger.warning(f"PDF compression failed ({pdf_err}), trying image...")
-            try:
-                (
-                    compressed_bytes,
-                    original_kb,
-                    compressed_kb,
-                    out_mime,
-                    out_ext,
-                ) = compress_image(file_bytes, mode)
-            except Exception as img_err:
-                logger.exception("Image compression also failed")
-                return jsonify(
-                    {
-                        "success": False,
-                        "error": f"PDF error: {pdf_err}; IMAGE error: {img_err}",
-                    }
-                ), 500
-
-        file_base64 = base64.b64encode(compressed_bytes).decode("ascii")
+        out_b64 = base64.b64encode(out_bytes).decode("ascii")
 
         return jsonify(
-            {
-                "success": True,
-                "fileBase64": file_base64,
-                "originalSizeKB": original_kb,
-                "compressedSizeKB": compressed_kb,
-                "outputMimeType": out_mime,
-                "outputExtension": out_ext,
-            }
+            success=True,
+            fileBase64=out_b64,
+            originalSizeKB=orig_kb,
+            compressedSizeKB=comp_kb,
+            outputMimeType=out_mime,
+            outputExtension=out_ext,
         )
 
+    except ValueError as e:
+        logger.exception("Value error while compressing")
+        return jsonify(success=False, error=str(e)), 500
     except Exception as e:
-        logger.exception("Error while compressing")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.exception("Unexpected error while compressing")
+        return jsonify(success=False, error="Unexpected error: " + str(e)), 500
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Family compressor API is running.", 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
