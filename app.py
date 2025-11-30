@@ -14,14 +14,33 @@ logger = logging.getLogger(__name__)
 
 
 def get_mode_settings(mode: str):
-    """تحويل اسم النمط إلى إعدادات التكبير وجودة JPEG."""
+    """
+    تحويل اسم النمط إلى إعدادات التكبير وجودة JPEG.
+
+    المبدأ الجديد:
+    1) high_compression    → ما زال قوي لكن مقروء
+    2) recommended         → توازن جيد (مقترح للاستخدام العادي)
+    3) low_compression     → جودة عالية، ضغط خفيف
+    """
     mode = (mode or "recommended").strip()
+
     if mode == "high_compression":
-        return 0.6, 45
+        # ضغط قوي لكن ليس قاتلاً جداً للجودة
+        zoom = 0.9      # تقريبًا نفس حجم الصفحة الأصلي
+        jpeg_quality = 65
+        return zoom, jpeg_quality
+
     if mode == "low_compression":
-        return 1.0, 75
+        # أفضل جودة – مفيد للجوازات والوثائق المهمة
+        zoom = 1.2      # دقة أعلى قليلاً
+        jpeg_quality = 90
+        return zoom, jpeg_quality
+
     # default = recommended
-    return 0.8, 60
+    zoom = 1.0          # نفس الدقة تقريباً
+    jpeg_quality = 80   # جودة جيدة جداً
+    return zoom, jpeg_quality
+
 
 
 def compress_bytes(file_bytes: bytes, file_type: str, mode: str):
@@ -138,3 +157,4 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
