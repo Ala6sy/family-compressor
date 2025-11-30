@@ -1,111 +1,132 @@
 import base64
-import io
 import logging
+import io
 
 from flask import Flask, request, jsonify
 import fitz  # PyMuPDF
 
-app = Flask(__name__)
-
+# إعداد اللوج
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-MODES = {
-    "high_compression": {
-        "zoom": 0.6,
-        "jpeg_quality": 45,
-    },
-    "recommended": {
-        "zoom": 0.8,
-        "jpeg_quality": 60,
-    },
-    "low_compression": {
-        "zoom": 1.0,
-        "jpeg_quality": 75,
-    },
-}
+app = Flask(__name__)
 
 
-def compress_pdf(pdf_bytes: bytes, mode: str) -> dict:
+def get_mode_params(mode: str):
     """
-    يضغط ملف PDF باستخدام PyMuPDF عن طريق تحويل الصفحات إلى صور ثم بناء PDF جديد.
+    اختيار درجة الضغط حسب الـ mode القادم من Apps Script.
     """
-    if mode not in MODES:
-        mode = "recommended"
+    mode = (mode or "").strip().lower()
 
-    zoom = MODES[mode]["zoom"]
-    jpeg_quality = MODES[mode]["jpeg_quality"]
+    if mode == "high_compression":
+        # ضغط شديد – جودة أقل
+        return 0.6, 45
+    elif mode == "low_compression":
+        # ضغط أقل – جودة أعلى
+        return 1.0, 75
+    else:
+        # recommended (الافتراضي)
+        return 0.8, 60
 
-    original_size_kb = len(pdf_bytes) // 1024
 
-    # افتح الملف الأصلي من الـ bytes
-    src_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    dst_doc = fitz.open()
+def compress_pdf(pdf_bytes: bytes, mode: str):
+    """
+    يأخذ PDF كـ bytes ويعيد:
+      - pdf_bytes المضغوط
+      - الحجم الأصلي و المضغوط بالكيلوبايت
+    """
+    zoom, jpeg_quality = get_mode_params(mode)
+    logger.info(f"Compressing PDF with mode={mode}, zoom={zoom}, jpeg_quality={jpeg_quality}")
 
-    matrix = fitz.Matrix(zoom, zoom)
+    original_size_kb = round(len(pdf_bytes) / 1024)
 
-    for page_index in range(len(src_doc)):
-        page = src_doc.load_page(page_index)
+    # فتح الـ PDF الأصلي من الذاكرة
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    new_doc = fitz.open()
 
-        # تحويل الصفحة إلى صورة
-        pix = page.get_pixmap(matrix=matrix)
+    for page_index in range(len(doc)):
+        page = doc.load_page(page_index)
 
-        # تحويل الصورة إلى JPEG مضغوط
-        img_bytes = pix.tobytes("jpeg", quality=jpeg_quality)
+        # تكبير / تصغير الصفحة
+        mat = fitz.Matrix(zoom, zoom)
 
-        # تحويل JPEG إلى PDF صفحة واحدة
+        # تحويل الصفحة لصورة
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+
+        # هنا كان الخطأ: استخدمت quality بدل jpg_quality
+        img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+
+        # فتح الصورة كملف PDF صفحة واحدة
         img_doc = fitz.open("jpeg", img_bytes)
-        img_pdf = fitz.open("pdf", img_doc.convert_to_pdf())
-        dst_doc.insert_pdf(img_pdf)
+        img_page = img_doc[0]
 
+        # إنشاء صفحة جديدة في الملف الجديد
+        new_page = new_doc.new_page(
+            width=img_page.rect.width,
+            height=img_page.rect.height
+        )
+
+        # إدراج الصورة في الصفحة الجديدة
+        new_page.show_pdf_page(new_page.rect, img_doc, 0)
         img_doc.close()
-        img_pdf.close()
 
-    compressed_bytes = dst_doc.tobytes()
-    dst_doc.close()
-    src_doc.close()
+    # كتابة الـ PDF الجديد في الذاكرة
+    compressed_bytes = new_doc.write()
+    new_doc.close()
+    doc.close()
 
-    compressed_size_kb = len(compressed_bytes) // 1024
+    compressed_size_kb = round(len(compressed_bytes) / 1024)
 
-    pdf_base64 = base64.b64encode(compressed_bytes).decode("ascii")
+    return compressed_bytes, original_size_kb, compressed_size_kb
 
-    return {
-        "success": True,
-        "pdfBase64": pdf_base64,
-        "originalSizeKB": original_size_kb,
-        "compressedSizeKB": compressed_size_kb,
-    }
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "message": "Family compressor API is running"})
 
 
 @app.route("/compress", methods=["POST"])
 def compress_endpoint():
+    """
+    يستقبل:
+      - file: ملف PDF (multipart/form-data)
+      - mode: high_compression / recommended / low_compression
+    ويرجع JSON يحتوي:
+      success, pdfBase64, originalSizeKB, compressedSizeKB
+    """
     try:
         if "file" not in request.files:
-            return jsonify({"success": False, "error": "No file field in request"}), 400
+            return jsonify({"success": False, "error": "No file part in request"}), 400
 
-        file_storage = request.files["file"]
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"success": False, "error": "Empty filename"}), 400
+
         mode = request.form.get("mode", "recommended")
+        pdf_bytes = file.read()
 
-        pdf_bytes = file_storage.read()
+        logger.info(
+            f"Received file for compression, mode={mode}, size={len(pdf_bytes)} bytes"
+        )
 
-        logger.info("Received file for compression, mode=%s, size=%d bytes",
-                    mode, len(pdf_bytes))
+        compressed_bytes, original_kb, compressed_kb = compress_pdf(pdf_bytes, mode)
 
-        result = compress_pdf(pdf_bytes, mode)
+        pdf_base64 = base64.b64encode(compressed_bytes).decode("ascii")
 
-        return jsonify(result)
+        return jsonify(
+            {
+                "success": True,
+                "pdfBase64": pdf_base64,
+                "originalSizeKB": original_kb,
+                "compressedSizeKB": compressed_kb,
+            }
+        )
 
     except Exception as e:
         logger.exception("Error while compressing PDF")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Family PDF Compressor API is running."
-
-
 if __name__ == "__main__":
-    # للتجربة المحلية فقط – في Render سيتم استخدام gunicorn
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    # لتجربة محلية فقط، في Render سيتم تشغيله عبر gunicorn
+    app.run(host="0.0.0.0", port=8000)
