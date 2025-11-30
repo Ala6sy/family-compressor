@@ -33,7 +33,7 @@ def compress_bytes(file_bytes: bytes, file_type: str, mode: str):
     original_kb = max(1, len(file_bytes) // 1024)
     file_type = (file_type or "").lower()
 
-    # نحاول أولاً كـ PDF لو كان النوع يشير لذلك
+    # --------- حالة PDF ---------
     if "pdf" in file_type:
         try:
             doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -45,6 +45,7 @@ def compress_bytes(file_bytes: bytes, file_type: str, mode: str):
 
         try:
             for page in doc:
+                # تحويل الصفحة إلى صورة
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
@@ -52,18 +53,19 @@ def compress_bytes(file_bytes: bytes, file_type: str, mode: str):
                 img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
                 img_bytes = buf.getvalue()
 
-                img_doc = fitz.open("jpeg", img_bytes)
-                out_pdf.insert_pdf(img_doc)
-
-            out_bytes = out_pdf.tobytes()
+                # صفحة جديدة في PDF الناتج ونضع الصورة عليها
+                new_page = out_pdf.new_page(width=pix.width, height=pix.height)
+                new_page.insert_image(new_page.rect, stream=img_bytes)
         finally:
-            out_pdf.close()
             doc.close()
+
+        out_bytes = out_pdf.tobytes()
+        out_pdf.close()
 
         compressed_kb = max(1, len(out_bytes) // 1024)
         return out_bytes, original_kb, compressed_kb, "application/pdf", ".pdf"
 
-    # غير PDF → نعاملها كصورة (JPG/PNG...)
+    # --------- حالة صورة (JPG / PNG ...) ---------
     try:
         img = Image.open(io.BytesIO(file_bytes))
     except Exception as e:
@@ -73,6 +75,7 @@ def compress_bytes(file_bytes: bytes, file_type: str, mode: str):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
     out_bytes = buf.getvalue()
+
     compressed_kb = max(1, len(out_bytes) // 1024)
     return out_bytes, original_kb, compressed_kb, "image/jpeg", ".jpg"
 
