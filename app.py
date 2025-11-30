@@ -17,29 +17,30 @@ def get_mode_settings(mode: str):
     """
     تحويل اسم النمط إلى إعدادات التكبير وجودة JPEG.
 
-    الآن:
-    1) high_compression  → ضغط واضح لكن الوثيقة تبقى مقروءة
-    2) recommended       → توازن قوي (جودة عالية + ضغط متوسط)
-    3) low_compression   → جودة عالية جداً، ضغط خفيف
+    إعدادات جديدة:
+    1) high_compression  → ضغط واضح، لكن ليس مبالغًا فيه
+    2) recommended       → ضغط خفيف، جودة عالية
+    3) low_compression   → شبه أصلي (quasi-lossless) تقريبًا
     """
     mode = (mode or "recommended").strip()
 
     if mode == "high_compression":
-        # ضغط واضح لكن لا يدمّر التفاصيل
-        zoom = 1.2       # أعلى من السابق
-        jpeg_quality = 80
+        # ما زال ضغط، لكن أفضل من اللي قبل
+        zoom = 1.2       # دقة جيدة
+        jpeg_quality = 85
         return zoom, jpeg_quality
 
     if mode == "low_compression":
-        # أفضل جودة ممكنة تقريباً (قريب من الملف الأصلي)
-        zoom = 2.0       # دقة أعلى من الأصل
-        jpeg_quality = 95
+        # شبه أصلي – أقل ضغط ممكن بدون ما نخزّن PNG
+        zoom = 1.8       # دقة أعلى من السابق
+        jpeg_quality = 98
         return zoom, jpeg_quality
 
     # default = recommended
-    zoom = 1.5          # دقة ممتازة
-    jpeg_quality = 90   # جودة عالية
+    zoom = 1.5          # بين الاثنين، مناسب للغالبية
+    jpeg_quality = 94   # جودة عالية جدًا
     return zoom, jpeg_quality
+
 
 
 
@@ -158,5 +159,6 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
 
 
